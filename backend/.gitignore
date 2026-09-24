@@ -1,0 +1,17 @@
+# Environment Variables (API Keys)
+.env
+.env.local
+*.env
+
+# Python Virtual Environment
+venv/
+env/
+ENV/
+
+# Python Cache & Compiled Files
+__pycache__/
+*.pyc
+
+# Uploaded Files & Temporary Outputs
+uploads/
+outputs/
