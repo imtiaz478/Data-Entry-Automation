@@ -1,14 +1,30 @@
-from fastapi import FastAPI, UploadFile, File
+import os
+import re
+import sys
+import uuid
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-
-import pandas as pd
-import os
 
 from services.search_service import search_web
 from services.webpage_service import get_webpage_text
 from services.extraction_service import extract_data
 from services.excel_service import update_excel
+from services.validation_service import is_empty
+from services.processing_service import (
+    META_COLUMNS,
+    read_table,
+    resolve_key_columns,
+    process_dataframe,
+    save_csv,
+)
+
+
+# Windows consoles default to cp1252, so printing Bangla text crashes
+for stream in (sys.stdout, sys.stderr):
+    if hasattr(stream, "reconfigure"):
+        stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 app = FastAPI()
@@ -20,7 +36,10 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -31,12 +50,145 @@ app.add_middleware(
 # Upload folder
 # =========================================
 
-UPLOAD_FOLDER = "uploads"
+UPLOAD_FOLDER = os.path.abspath("uploads")
 
 os.makedirs(
     UPLOAD_FOLDER,
     exist_ok=True
 )
+
+ALLOWED_EXTENSIONS = {".xlsx", ".xls", ".csv"}
+
+
+def safe_upload_path(filename: str) -> str:
+
+    # Only plain file names inside UPLOAD_FOLDER, no "../" or "..\"
+    name = os.path.basename(
+        str(filename or "").replace("\\", "/")
+    )
+
+    if name in ("", ".", ".."):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file name"
+        )
+
+    path = os.path.abspath(
+        os.path.join(UPLOAD_FOLDER, name)
+    )
+
+    if os.path.dirname(path) != UPLOAD_FOLDER:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file name"
+        )
+
+    return path
+
+
+def save_upload(file: UploadFile) -> str:
+
+    original_name = os.path.basename(
+        (file.filename or "").replace("\\", "/")
+    )
+
+    base_name, extension = os.path.splitext(original_name)
+
+    extension = extension.lower()
+
+    if extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Only .xlsx, .xls and .csv files are supported"
+        )
+
+    base_name = re.sub(r"[^\w\-]+", "_", base_name).strip("_") or "file"
+
+    # Random prefix so two uploads with the same name do not clash
+    stored_name = f"{uuid.uuid4().hex[:8]}_{base_name}{extension}"
+
+    path = safe_upload_path(stored_name)
+
+    with open(path, "wb") as buffer:
+        buffer.write(file.file.read())
+
+    return path
+
+
+def load_table(file_path: str):
+
+    try:
+        return read_table(file_path)
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not read file: {error}"
+        )
+
+
+def parse_list(value) -> list:
+
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    return [
+        item.strip()
+        for item in str(value or "").split(",")
+        if item.strip()
+    ]
+
+
+def run_pipeline(
+    file_path: str,
+    labels: list,
+    key_columns: list,
+    sort_by: str,
+    sort_order: str
+):
+
+    df = load_table(file_path)
+
+    print("================================")
+    print("Processing file:", os.path.basename(file_path))
+    print("Columns:", df.columns.tolist())
+    print("Rows:", len(df))
+    print("================================")
+
+    try:
+        df, results = process_dataframe(
+            df,
+            labels=labels,
+            key_columns=key_columns,
+            sort_by=sort_by or None,
+            ascending=(sort_order or "asc").lower() != "desc"
+        )
+
+    except ValueError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=str(error)
+        )
+
+    base_name = os.path.splitext(
+        os.path.basename(file_path)
+    )[0]
+
+    output_filename = base_name + "_completed.csv"
+
+    save_csv(df, safe_upload_path(output_filename))
+
+    print()
+    print("================================")
+    print("NEW CSV CREATED:", output_filename)
+    print("================================")
+
+    return {
+        "message": "File processed successfully",
+        "filename": output_filename,
+        "download_url": f"/download/{output_filename}",
+        "results": results
+    }
 
 
 # =========================================
@@ -52,33 +204,22 @@ def home():
 
 
 # =========================================
-# Upload Excel
+# Upload file (preview + column list)
 # =========================================
 
 @app.post("/upload-excel")
-async def upload_excel(
+def upload_excel(
     file: UploadFile = File(...)
 ):
 
-    file_path = os.path.join(
-        UPLOAD_FOLDER,
-        file.filename
-    )
+    file_path = save_upload(file)
 
-    with open(
-        file_path,
-        "wb"
-    ) as buffer:
+    df = load_table(file_path)
 
-        buffer.write(
-            await file.read()
-        )
-
-
-    df = pd.read_excel(
-        file_path
-    )
-
+    data_columns = [
+        column for column in df.columns
+        if column not in META_COLUMNS
+    ]
 
     # =====================================
     # Analyze columns
@@ -86,33 +227,18 @@ async def upload_excel(
 
     columns = []
 
-    for column in df.columns:
-
-        total_cells = len(
-            df[column]
-        )
+    for column in data_columns:
 
         empty_cells = int(
-            df[column].isna().sum()
-        )
-
-        filled_cells = (
-            total_cells
-            - empty_cells
+            df[column].map(is_empty).sum()
         )
 
         columns.append({
-
             "name": column,
-
-            "total": total_cells,
-
-            "filled": filled_cells,
-
+            "total": len(df),
+            "filled": len(df) - empty_cells,
             "empty": empty_cells
-
         })
-
 
     # =====================================
     # Analyze rows
@@ -120,48 +246,30 @@ async def upload_excel(
 
     rows = []
 
-    for index, row in df.iterrows():
-
-        row_data = {}
-
-        for column in df.columns:
-
-            value = row[column]
-
-            if pd.isna(value):
-
-                row_data[column] = None
-
-            else:
-
-                row_data[column] = str(
-                    value
-                )
-
+    for position, (_, row) in enumerate(df.iterrows()):
 
         rows.append({
-
-            "row_number": index + 1,
-
-            "data": row_data
-
+            "row_number": position + 1,
+            "data": {
+                column: None if is_empty(row[column]) else str(row[column])
+                for column in data_columns
+            }
         })
 
+    try:
+        default_key_columns = resolve_key_columns(df)
+
+    except ValueError:
+        default_key_columns = []
 
     return {
-
         "filename": file.filename,
-
+        "stored_filename": os.path.basename(file_path),
         "total_rows": len(df),
-
-        "total_columns": len(
-            df.columns
-        ),
-
+        "total_columns": len(data_columns),
+        "default_key_columns": default_key_columns,
         "columns": columns,
-
         "rows": rows
-
     }
 
 
@@ -172,11 +280,7 @@ async def upload_excel(
 @app.get("/search")
 def search(query: str):
 
-    results = search_web(
-        query
-    )
-
-    return results
+    return search_web(query)
 
 
 # =========================================
@@ -189,29 +293,15 @@ def search_row(
     company: str
 ):
 
-    query = (
-        f"{product} "
-        f"{company} "
-        f"Bangladesh"
-    )
+    query = f"{product} {company} Bangladesh"
 
-    results = search_web(
-        query
-    )
+    results = search_web(query)
 
     return {
-
         "product": product,
-
         "company": company,
-
         "query": query,
-
-        "results": results.get(
-            "results",
-            []
-        )
-
+        "results": results.get("results", [])
     }
 
 
@@ -224,16 +314,9 @@ def read_webpage(
     url: str
 ):
 
-    text = get_webpage_text(
-        url
-    )
-
     return {
-
         "url": url,
-
-        "text": text
-
+        "text": get_webpage_text(url)
     }
 
 
@@ -246,32 +329,11 @@ def extract_data_endpoint(
     data: dict
 ):
 
-    webpage_text = data.get(
-        "webpage_text",
-        ""
+    return extract_data(
+        webpage_text=data.get("webpage_text", ""),
+        existing_data=data.get("existing_data", {}),
+        missing_fields=data.get("missing_fields", [])
     )
-
-    existing_data = data.get(
-        "existing_data",
-        {}
-    )
-
-    missing_fields = data.get(
-        "missing_fields",
-        []
-    )
-
-    result = extract_data(
-
-        webpage_text=webpage_text,
-
-        existing_data=existing_data,
-
-        missing_fields=missing_fields
-
-    )
-
-    return result
 
 
 # =========================================
@@ -283,89 +345,55 @@ def update_excel_endpoint(
     data: dict
 ):
 
-    print(
-        "Received data:",
-        data
-    )
+    print("Received data:", data)
 
-    file_path = data.get(
-        "file_path"
-    )
+    file_name = data.get("file_path")
 
-    row_index = data.get(
-        "row_index"
-    )
+    row_index = data.get("row_index")
 
-    extracted_data = data.get(
-        "extracted_data",
-        {}
-    )
+    extracted_data = data.get("extracted_data", {})
 
-
-    if not file_path:
-
-        return {
-
-            "error":
-            "file_path is missing"
-
-        }
-
+    if not file_name:
+        return {"error": "file_path is missing"}
 
     if row_index is None:
-
-        return {
-
-            "error":
-            "row_index is missing"
-
-        }
-
+        return {"error": "row_index is missing"}
 
     # Do not update if Gemini failed
-
-    if extracted_data.get(
-        "error"
-    ):
-
+    if extracted_data.get("error"):
         return {
-
-            "error":
-            "Gemini extraction failed",
-
-            "details":
-            extracted_data
-
+            "error": "Gemini extraction failed",
+            "details": extracted_data
         }
 
+    file_path = safe_upload_path(file_name)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="File not found"
+        )
+
+    if not file_path.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(
+            status_code=400,
+            detail="Only Excel files can be updated here"
+        )
 
     result = update_excel(
-
         file_path=file_path,
-
-        row_index=int(
-            row_index
-        ),
-
-        extracted_data=
-            extracted_data
-
+        row_index=int(row_index),
+        extracted_data=extracted_data
     )
 
-
     return {
-
-        "message":
-        "Excel updated successfully",
-
-        "rows":
-        len(result)
-
+        "message": "Excel updated successfully",
+        "rows": len(result)
     }
 
 
 # =========================================
-# RUN TASK
+# RUN TASK (file already uploaded)
 # =========================================
 
 @app.post("/run-task")
@@ -373,1235 +401,50 @@ def run_task(
     data: dict
 ):
 
-    file_path = data.get(
-        "file_path"
+    file_name = data.get("file_path")
+
+    if not file_name:
+        return {"error": "file_path is missing"}
+
+    file_path = safe_upload_path(file_name)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="File not found"
+        )
+
+    return run_pipeline(
+        file_path,
+        labels=parse_list(data.get("labels")),
+        key_columns=parse_list(data.get("key_columns")),
+        sort_by=data.get("sort_by", ""),
+        sort_order=data.get("sort_order", "asc")
     )
-
-
-    if not file_path:
-
-        return {
-
-            "error":
-            "file_path is missing"
-
-        }
-
-
-    # =====================================
-    # Read Excel
-    # =====================================
-
-    df = pd.read_excel(
-        file_path
-    )
-
-
-    print(
-        "================================"
-    )
-
-    print(
-        "Excel loaded successfully"
-    )
-
-    print(
-        "File:",
-        file_path
-    )
-
-    print(
-        "Columns:",
-        df.columns.tolist()
-    )
-
-    print(
-        "Rows:",
-        len(df)
-    )
-
-    print(
-        "================================"
-    )
-
-
-    results = []
-
-
-    # =====================================
-    # Process every row
-    # =====================================
-
-    for row_index, row in df.iterrows():
-
-        product = row.get(
-            "Product"
-        )
-
-        company = row.get(
-            "Company"
-        )
-
-
-        # Product / Company missing
-
-        if (
-            pd.isna(product)
-            or pd.isna(company)
-        ):
-
-            continue
-
-
-        product = str(
-            product
-        ).strip()
-
-        company = str(
-            company
-        ).strip()
-
-
-        print()
-        print(
-            "================================"
-        )
-
-        print(
-            "Processing row:",
-            row_index + 1
-        )
-
-        print(
-            "Product:",
-            product
-        )
-
-        print(
-            "Company:",
-            company
-        )
-
-
-        # =================================
-        # Find missing fields
-        # =================================
-
-        missing_fields = []
-
-
-        for column in df.columns:
-
-            value = row[column]
-
-
-            if (
-                pd.isna(value)
-                or str(value).strip() == ""
-            ):
-
-                missing_fields.append(
-                    column
-                )
-
-
-        print(
-            "Missing fields:",
-            missing_fields
-        )
-
-
-        # Nothing missing
-
-        if not missing_fields:
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Already complete"
-
-            })
-
-            continue
-
-
-        # =================================
-        # Search web
-        # =================================
-
-        query = (
-            f"{product} "
-            f"{company} "
-            f"Bangladesh"
-        )
-
-
-        print(
-            "Searching:",
-            query
-        )
-
-
-        try:
-
-            search_result = search_web(
-                query
-            )
-
-        except Exception as error:
-
-            print(
-                "Search error:",
-                error
-            )
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Search failed",
-
-                "error":
-                str(error)
-
-            })
-
-            continue
-
-
-        search_results = (
-            search_result.get(
-                "results",
-                []
-            )
-        )
-
-
-        if not search_results:
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "No search result"
-
-            })
-
-            continue
-
-
-        # =================================
-        # Select URL
-        # =================================
-
-        first_result = (
-            search_results[0]
-        )
-
-        url = first_result.get(
-            "url"
-        )
-
-
-        if not url:
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "No URL found"
-
-            })
-
-            continue
-
-
-        print(
-            "Selected URL:",
-            url
-        )
-
-
-        # =================================
-        # Read webpage
-        # =================================
-
-        try:
-
-            webpage_text = (
-                get_webpage_text(
-                    url
-                )
-            )
-
-        except Exception as error:
-
-            print(
-                "Webpage error:",
-                error
-            )
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Could not read webpage",
-
-                "url":
-                url,
-
-                "error":
-                str(error)
-
-            })
-
-            continue
-
-
-        if (
-            not webpage_text
-            or webpage_text.startswith(
-                "ERROR"
-            )
-        ):
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Could not read webpage",
-
-                "url":
-                url
-
-            })
-
-            continue
-
-
-        # =================================
-        # Existing data
-        # =================================
-
-        existing_data = {}
-
-
-        for column in df.columns:
-
-            value = row[column]
-
-
-            if pd.isna(value):
-
-                existing_data[
-                    column
-                ] = None
-
-            else:
-
-                existing_data[
-                    column
-                ] = str(value)
-
-
-        # =================================
-        # Gemini extraction
-        # =================================
-
-        print(
-            "Sending data to Gemini..."
-        )
-
-
-        try:
-
-            extracted_data = extract_data(
-
-                webpage_text=
-                    webpage_text,
-
-                existing_data=
-                    existing_data,
-
-                missing_fields=
-                    missing_fields
-
-            )
-
-        except Exception as error:
-
-            print(
-                "Gemini error:",
-                error
-            )
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Gemini failed",
-
-                "url":
-                url,
-
-                "error":
-                str(error)
-
-            })
-
-            continue
-
-
-        print(
-            "Gemini result:",
-            extracted_data
-        )
-
-
-        # =================================
-        # Gemini failed
-        # =================================
-
-        if (
-            not extracted_data
-            or extracted_data.get(
-                "error"
-            )
-        ):
-
-            print(
-                "Gemini failed."
-            )
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Gemini failed",
-
-                "url":
-                url,
-
-                "extracted_data":
-                extracted_data
-
-            })
-
-            continue
-
-
-        # =================================
-        # Match Excel columns
-        # =================================
-
-        normalized_columns = {}
-
-
-        for column in df.columns:
-
-            normalized_columns[
-                str(column)
-                .strip()
-                .lower()
-            ] = column
-
-
-        excel_ready_data = {}
-
-
-        for field, value in (
-            extracted_data.items()
-        ):
-
-            field_normalized = (
-                str(field)
-                .strip()
-                .lower()
-            )
-
-
-            if (
-                field_normalized
-                not in normalized_columns
-            ):
-
-                continue
-
-
-            actual_column = (
-                normalized_columns[
-                    field_normalized
-                ]
-            )
-
-
-            if value is not None:
-
-                excel_ready_data[
-                    actual_column
-                ] = value
-
-
-        # =================================
-        # No usable data
-        # =================================
-
-        if not excel_ready_data:
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "No usable data extracted",
-
-                "url":
-                url,
-
-                "extracted_data":
-                extracted_data
-
-            })
-
-            continue
-
-
-        # =================================
-        # Update Excel
-        # =================================
-
-        try:
-
-            update_excel(
-
-                file_path=
-                    file_path,
-
-                row_index=
-                    row_index,
-
-                extracted_data=
-                    excel_ready_data
-
-            )
-
-        except Exception as error:
-
-            print(
-                "Excel update failed:",
-                error
-            )
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Excel update failed",
-
-                "url":
-                url,
-
-                "error":
-                str(error)
-
-            })
-
-            continue
-
-
-        results.append({
-
-            "row":
-            row_index + 1,
-
-            "product":
-            product,
-
-            "status":
-            "Updated",
-
-            "url":
-            url,
-
-            "extracted_data":
-            extracted_data
-
-        })
-
-
-    return {
-
-        "message":
-        "Task completed",
-
-        "results":
-        results
-
-    }
 
 
 # =========================================
-# PROCESS EXCEL → NEW CSV
+# PROCESS FILE → NEW CSV
 # =========================================
 
 @app.post("/process-excel")
-async def process_excel(
-    file: UploadFile = File(...)
+def process_excel(
+    file: UploadFile = File(...),
+    labels: str = Form(""),
+    key_columns: str = Form(""),
+    sort_by: str = Form(""),
+    sort_order: str = Form("asc")
 ):
 
-    print(
-        "================================"
-    )
+    file_path = save_upload(file)
 
-    print(
-        "Processing uploaded file:",
-        file.filename
-    )
-
-    print(
-        "================================"
-    )
-
-
-    # =====================================
-    # 1. Save uploaded Excel
-    # =====================================
-
-    file_path = os.path.join(
-        UPLOAD_FOLDER,
-        file.filename
-    )
-
-
-    with open(
+    return run_pipeline(
         file_path,
-        "wb"
-    ) as buffer:
-
-        buffer.write(
-            await file.read()
-        )
-
-
-    # =====================================
-    # 2. Read Excel
-    # =====================================
-
-    df = pd.read_excel(
-        file_path
+        labels=parse_list(labels),
+        key_columns=parse_list(key_columns),
+        sort_by=sort_by,
+        sort_order=sort_order
     )
-
-
-    print(
-        "Original Excel:"
-    )
-
-    print(df)
-
-
-    # =====================================
-    # 3. Process each row
-    # =====================================
-
-    results = []
-
-
-    for row_index, row in df.iterrows():
-
-        product = row.get(
-            "Product"
-        )
-
-        company = row.get(
-            "Company"
-        )
-
-
-        # Product / Company missing
-
-        if (
-            pd.isna(product)
-            or pd.isna(company)
-        ):
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "status":
-                "Skipped",
-
-                "reason":
-                "Product or Company missing"
-
-            })
-
-            continue
-
-
-        product = str(
-            product
-        ).strip()
-
-        company = str(
-            company
-        ).strip()
-
-
-        print()
-        print(
-            "--------------------------------"
-        )
-
-        print(
-            "Processing:",
-            product
-        )
-
-        print(
-            "Company:",
-            company
-        )
-
-
-        # =================================
-        # Find missing fields
-        # =================================
-
-        missing_fields = []
-
-
-        for column in df.columns:
-
-            value = row[column]
-
-
-            if (
-                pd.isna(value)
-                or str(value).strip() == ""
-            ):
-
-                missing_fields.append(
-                    column
-                )
-
-
-        # Already complete
-
-        if not missing_fields:
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Already complete"
-
-            })
-
-            continue
-
-
-        print(
-            "Missing:",
-            missing_fields
-        )
-
-
-        # =================================
-        # Search
-        # =================================
-
-        query = (
-            f"{product} "
-            f"{company} "
-            f"Bangladesh"
-        )
-
-
-        try:
-
-            search_result = search_web(
-                query
-            )
-
-            search_results = (
-                search_result.get(
-                    "results",
-                    []
-                )
-            )
-
-        except Exception as error:
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Search failed",
-
-                "error":
-                str(error)
-
-            })
-
-            continue
-
-
-        if not search_results:
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "No search result"
-
-            })
-
-            continue
-
-
-        # =================================
-        # Get first URL
-        # =================================
-
-        url = search_results[0].get(
-            "url"
-        )
-
-
-        if not url:
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "No URL found"
-
-            })
-
-            continue
-
-
-        print(
-            "URL:",
-            url
-        )
-
-
-        # =================================
-        # Read webpage
-        # =================================
-
-        try:
-
-            webpage_text = (
-                get_webpage_text(
-                    url
-                )
-            )
-
-        except Exception as error:
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Webpage read failed",
-
-                "url":
-                url,
-
-                "error":
-                str(error)
-
-            })
-
-            continue
-
-
-        if (
-            not webpage_text
-            or webpage_text.startswith(
-                "ERROR"
-            )
-        ):
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Webpage read failed",
-
-                "url":
-                url
-
-            })
-
-            continue
-
-
-        # =================================
-        # Existing data
-        # =================================
-
-        existing_data = {}
-
-
-        for column in df.columns:
-
-            value = row[column]
-
-
-            if pd.isna(value):
-
-                existing_data[
-                    column
-                ] = None
-
-            else:
-
-                existing_data[
-                    column
-                ] = str(value)
-
-
-        # =================================
-        # Extract
-        # =================================
-
-        try:
-
-            extracted_data = extract_data(
-
-                webpage_text=
-                    webpage_text,
-
-                existing_data=
-                    existing_data,
-
-                missing_fields=
-                    missing_fields
-
-            )
-
-        except Exception as error:
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Gemini failed",
-
-                "url":
-                url,
-
-                "error":
-                str(error)
-
-            })
-
-            continue
-
-
-        print(
-            "Extracted:",
-            extracted_data
-        )
-
-
-        # =================================
-        # Gemini failed
-        # =================================
-
-        if (
-            not extracted_data
-            or extracted_data.get(
-                "error"
-            )
-        ):
-
-            results.append({
-
-                "row":
-                row_index + 1,
-
-                "product":
-                product,
-
-                "status":
-                "Gemini failed",
-
-                "url":
-                url,
-
-                "extracted_data":
-                extracted_data
-
-            })
-
-            continue
-
-
-        # =================================
-        # Match columns
-        # =================================
-
-        normalized_columns = {}
-
-
-        for column in df.columns:
-
-            normalized_columns[
-                str(column)
-                .strip()
-                .lower()
-            ] = column
-
-
-        excel_ready_data = {}
-
-
-        for field, value in (
-            extracted_data.items()
-        ):
-
-            field_normalized = (
-                str(field)
-                .strip()
-                .lower()
-            )
-
-
-            if (
-                field_normalized
-                not in normalized_columns
-            ):
-
-                continue
-
-
-            actual_column = (
-                normalized_columns[
-                    field_normalized
-                ]
-            )
-
-
-            if value is not None:
-
-                excel_ready_data[
-                    actual_column
-                ] = value
-
-
-        # =================================
-        # Update dataframe directly
-        # =================================
-
-        for field, value in (
-            excel_ready_data.items()
-        ):
-
-            current_value = (
-                df.at[
-                    row_index,
-                    field
-                ]
-            )
-
-
-            # IMPORTANT:
-            # Only fill empty cells
-
-            if (
-                pd.isna(current_value)
-                or str(
-                    current_value
-                ).strip() == ""
-            ):
-
-                df.at[
-                    row_index,
-                    field
-                ] = value
-
-
-                print(
-                    f"Filled {field} -> {value}"
-                )
-
-
-        results.append({
-
-            "row":
-            row_index + 1,
-
-            "product":
-            product,
-
-            "status":
-            "Updated",
-
-            "url":
-            url,
-
-            "extracted_data":
-            extracted_data
-
-        })
-
-
-    # =====================================
-    # 4. Create NEW CSV
-    # =====================================
-
-    base_name = os.path.splitext(
-        file.filename
-    )[0]
-
-
-    output_filename = (
-        base_name
-        + "_completed.csv"
-    )
-
-
-    output_path = os.path.join(
-        UPLOAD_FOLDER,
-        output_filename
-    )
-
-
-    df.to_csv(
-        output_path,
-        index=False
-    )
-
-
-    print()
-    print(
-        "================================"
-    )
-
-    print(
-        "NEW CSV CREATED"
-    )
-
-    print(
-        "File:",
-        output_path
-    )
-
-    print(
-        "================================"
-    )
-
-
-    # =====================================
-    # 5. Return download URL
-    # =====================================
-
-    return {
-
-        "message":
-        "File processed successfully",
-
-        "filename":
-        output_filename,
-
-        "download_url":
-        f"/download/{output_filename}",
-
-        "results":
-        results
-
-    }
 
 
 # =========================================
@@ -1613,30 +456,27 @@ def download_file(
     filename: str
 ):
 
-    file_path = os.path.join(
-        UPLOAD_FOLDER,
-        filename
-    )
+    file_path = safe_upload_path(filename)
 
-
-    if not os.path.exists(
-        file_path
-    ):
-
-        return {
-
-            "error":
-            "File not found"
-
-        }
-
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="File not found"
+        )
 
     return FileResponse(
-
         path=file_path,
-
         media_type="text/csv",
-
         filename=filename
-
     )
+
+
+# =========================================
+# python main.py
+# =========================================
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)

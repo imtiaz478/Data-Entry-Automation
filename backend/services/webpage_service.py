@@ -1,10 +1,18 @@
+from urllib.parse import urlparse
+
 import requests
 from bs4 import BeautifulSoup
+
+
+MAX_TEXT_LENGTH = 15000
 
 
 def get_webpage_text(url: str):
 
     try:
+
+        if urlparse(url).scheme not in ("http", "https"):
+            return "ERROR: only http/https links are allowed"
 
         response = requests.get(
             url,
@@ -16,8 +24,10 @@ def get_webpage_text(url: str):
 
         response.raise_for_status()
 
+        # Pass bytes so BeautifulSoup reads the page's own charset;
+        # response.text guesses wrong on many sites and breaks "৳"
         soup = BeautifulSoup(
-            response.text,
+            response.content,
             "html.parser"
         )
 
@@ -37,8 +47,8 @@ def get_webpage_text(url: str):
             strip=True
         )
 
-        # Too much text হলে প্রথম 10000 characters
-        text = text[:10000]
+        # Too much text হলে প্রথম MAX_TEXT_LENGTH characters
+        text = text[:MAX_TEXT_LENGTH]
 
         return text
 

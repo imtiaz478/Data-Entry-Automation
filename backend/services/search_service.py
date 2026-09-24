@@ -4,33 +4,41 @@ from dotenv import load_dotenv
 from tavily import TavilyClient
 
 
-
 load_dotenv()
 
 
-
-API_KEY = os.getenv("TAVILY_API_KEY")
-
-
-if not API_KEY:
-    raise ValueError(
-        "TAVILY_API_KEY is missing from .env"
-    )
+# Created on first use, so the server can start (and process
+# files that are already complete) without a Tavily key
+_tavily_client = None
 
 
+def _get_client():
 
-tavily_client = TavilyClient(
-    api_key=API_KEY
-)
+    global _tavily_client
+
+    if _tavily_client is None:
+
+        api_key = os.getenv("TAVILY_API_KEY")
+
+        if not api_key:
+            raise RuntimeError(
+                "TAVILY_API_KEY is missing from .env"
+            )
+
+        _tavily_client = TavilyClient(
+            api_key=api_key
+        )
+
+    return _tavily_client
 
 
-def search_web(query: str):
+def search_web(query: str, max_results: int = 5):
 
     # Internet search
-    response = tavily_client.search(
+    response = _get_client().search(
         query=query,
         search_depth="basic",
-        max_results=5
+        max_results=max_results
     )
 
     return response

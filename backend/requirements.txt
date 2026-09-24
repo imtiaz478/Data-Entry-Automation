@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-multipart
+pandas
+openpyxl
+xlrd
+requests
+beautifulsoup4
+python-dotenv
+openai
+tavily-python
